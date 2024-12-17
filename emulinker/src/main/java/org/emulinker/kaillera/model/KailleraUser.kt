@@ -11,7 +11,6 @@ import kotlin.Throws
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.nanoseconds
 import kotlin.time.Duration.Companion.seconds
-import kotlin.time.DurationUnit.MILLISECONDS
 import kotlinx.datetime.Clock
 import kotlinx.datetime.Instant
 import org.emulinker.config.RuntimeFlags
@@ -26,6 +25,7 @@ import org.emulinker.kaillera.model.event.UserQuitGameEvent
 import org.emulinker.kaillera.model.exception.*
 import org.emulinker.kaillera.model.impl.KailleraGameImpl
 import org.emulinker.util.EmuLang
+import org.emulinker.util.EmuUtil.toSecondDoublePrecisionString
 import org.emulinker.util.TimeOffsetCache
 
 /**
@@ -75,11 +75,11 @@ class KailleraUser(
   /** This marks the last time the user interacted in the server. */
   private var lastActivity: Instant = initTime
 
-  private var singleFrameDurationNs = 0.seconds.inWholeNanoseconds
   private var lagLeewayNs = 0.seconds.inWholeNanoseconds
   private var totalDriftNs = 0.seconds.inWholeNanoseconds
   private val totalDriftCache =
     TimeOffsetCache(delay = flags.lagstatDuration, resolution = 5.seconds)
+  private var receivedGameDataNs: Long? = null
 
   /** The last time we heard from this player for lag detection purposes. */
   private var lastUpdateNs = System.nanoTime()
@@ -220,22 +220,20 @@ class KailleraUser(
   }
 
   fun stop() {
-    synchronized(this) {
-      if (!threadIsActive) {
-        logger.atFine().log("%s  thread stop request ignored: not running!", this)
-        return
-      }
-      if (stopFlag) {
-        logger.atFine().log("%s  thread stop request ignored: already stopping!", this)
-        return
-      }
-      stopFlag = true
-      queueEvent(StopFlagEvent())
+    if (!threadIsActive) {
+      logger.atFine().log("%s  thread stop request ignored: not running!", this)
+      return
     }
+    if (stopFlag) {
+      logger.atFine().log("%s  thread stop request ignored: already stopping!", this)
+      return
+    }
+    stopFlag = true
+    queueEvent(StopFlagEvent())
     listener.stop()
   }
 
-  fun droppedPacket() = withLock {
+  fun droppedPacket() {
     if (game != null) {
       // if(game.getStatus() == KailleraGame.STATUS_PLAYING){
       game!!.droppedPacket(this)
@@ -244,12 +242,12 @@ class KailleraUser(
   }
 
   // server actions
-  fun login(): Result<Unit> = withLock {
+  @Synchronized
+  fun login(): Result<Unit> {
     updateLastActivity()
     return server.login(this)
   }
 
-  @Synchronized
   @Throws(ChatException::class, FloodException::class)
   fun chat(message: String?) {
     updateLastActivity()
@@ -258,7 +256,7 @@ class KailleraUser(
   }
 
   @Throws(GameKickException::class)
-  fun gameKick(userID: Int) = withLock {
+  fun gameKick(userID: Int) {
     updateLastActivity()
     if (game == null) {
       logger.atWarning().log("%s kick User %d failed: Not in a game", this, userID)
@@ -288,13 +286,14 @@ class KailleraUser(
     return game
   }
 
+  @Synchronized
   @Throws(
     QuitException::class,
     DropGameException::class,
     QuitGameException::class,
     CloseGameException::class
   )
-  fun quit(message: String?) = withLock {
+  fun quit(message: String?) {
     updateLastActivity()
     server.quit(this, message)
     loggedIn = false
@@ -304,15 +303,16 @@ class KailleraUser(
     (totalDriftNs - (totalDriftCache.getDelayedValue() ?: 0))
       .nanoseconds
       .absoluteValue
-      .toString(MILLISECONDS)
+      .toSecondDoublePrecisionString()
 
   fun resetLag() {
     totalDriftNs = 0
     totalDriftCache.clear()
   }
 
+  @Synchronized
   @Throws(JoinGameException::class)
-  fun joinGame(gameID: Int): KailleraGame = withLock {
+  fun joinGame(gameID: Int): KailleraGame {
     updateLastActivity()
     if (game != null) {
       logger.atWarning().log("%s join game failed: Already in: %s", this, game)
@@ -370,8 +370,9 @@ class KailleraUser(
     game.chat(this, message)
   }
 
+  @Synchronized
   @Throws(DropGameException::class)
-  fun dropGame() = withLock {
+  fun dropGame() {
     updateLastActivity()
     if (status == UserStatus.IDLE) {
       return
@@ -389,8 +390,9 @@ class KailleraUser(
     }
   }
 
+  @Synchronized
   @Throws(DropGameException::class, QuitGameException::class, CloseGameException::class)
-  fun quitGame() = withLock {
+  fun quitGame() {
     updateLastActivity()
     if (game == null) {
       logger.atFine().log("%s quit game failed: Not in a game", this)
@@ -425,8 +427,9 @@ class KailleraUser(
     game.start(this)
   }
 
+  @Synchronized
   @Throws(UserReadyException::class)
-  fun playerReady() = withLock {
+  fun playerReady() {
     updateLastActivity()
     val game = this.game
     if (game == null) {
@@ -441,14 +444,8 @@ class KailleraUser(
     }
     totalDelay = game.highestUserFrameDelay + tempDelay + 5
 
-    val singleFrameDuration = 1.seconds / connectionType.updatesPerSecond
-
-    singleFrameDurationNs = singleFrameDuration.inWholeNanoseconds
-
     game.ready(this, playerNumber)
   }
-
-  var receivedGameDataNs: Long? = null
 
   fun addGameData(data: ByteArray): Result<Unit> {
     receivedGameDataNs = System.nanoTime()
@@ -531,15 +528,16 @@ class KailleraUser(
     val delaySinceLastResponseNs = nowNs - lastUpdateNs
     val timeWaitingNs = nowNs - receivedGameDataNs
     val delaySinceLastResponseMinusWaitingNs = delaySinceLastResponseNs - timeWaitingNs
-    val leewayChangeNs = singleFrameDurationNs - delaySinceLastResponseMinusWaitingNs
+    val leewayChangeNs =
+      game!!.singleFrameDurationForLagCalculationOnlyNs - delaySinceLastResponseMinusWaitingNs
     lagLeewayNs += leewayChangeNs
     if (lagLeewayNs < 0) {
       // Lag leeway fell below zero. We caused lag!
       totalDriftNs += lagLeewayNs
       lagLeewayNs = 0
-    } else if (lagLeewayNs > singleFrameDurationNs) {
+    } else if (lagLeewayNs > game!!.singleFrameDurationForLagCalculationOnlyNs) {
       // Does not make sense to allow lag leeway to be longer than the length of one frame.
-      lagLeewayNs = singleFrameDurationNs
+      lagLeewayNs = game!!.singleFrameDurationForLagCalculationOnlyNs
     }
     lastUpdateNs = nowNs
     totalDriftCache.update(totalDriftNs, nowNs = nowNs)
@@ -584,11 +582,6 @@ class KailleraUser(
       }
     }
   }
-
-  private val o = Object()
-
-  /** Helper function to avoid one level of indentation. */
-  private inline fun <T> withLock(action: () -> T): T = synchronized(o) { action() }
 
   companion object {
     private val logger = FluentLogger.forEnclosingClass()

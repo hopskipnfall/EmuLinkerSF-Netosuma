@@ -1,5 +1,6 @@
 package org.emulinker.kaillera.model.impl
 
+import com.codahale.metrics.MetricRegistry
 import com.google.common.flogger.FluentLogger
 import java.lang.Exception
 import java.util.Date
@@ -42,6 +43,8 @@ import org.emulinker.util.EmuLang
 import org.emulinker.util.EmuUtil.threadSleep
 import org.emulinker.util.EmuUtil.toMillisDouble
 import org.emulinker.util.TimeOffsetCache
+import org.koin.core.component.KoinComponent
+import org.koin.core.component.inject
 
 class KailleraGameImpl(
   override val id: Int,
@@ -51,7 +54,9 @@ class KailleraGameImpl(
   val bufferSize: Int,
   flags: RuntimeFlags,
   private val clock: Clock,
-) : KailleraGame {
+) : KailleraGame, KoinComponent {
+
+  private val metrics: MetricRegistry by inject()
 
   override var highestUserFrameDelay = 0
   override var maxPing = 1000
@@ -71,12 +76,13 @@ class KailleraGameImpl(
    */
   var waitingOnData = false
   /**
-   * If [waitingOnPlayerNumber[playerNumber - 1] is `true`, we are waiting on data for that player.
+   * If `waitingOnPlayerNumber[playerNumber - 1]` is `true`, we are waiting on data for that player.
    */
   val waitingOnPlayerNumber = BooleanArray(10) { false }
 
   // TODO(nue): Combine this with [KailleraUser.singleFrameDurationNs].
-  private var singleFrameDurationNs: Long = 0
+  var singleFrameDurationForLagCalculationOnlyNs = 0L
+    private set
 
   /** Last time we fanned out data for a frame. */
   private var lastFrameNs = System.nanoTime()
@@ -86,7 +92,10 @@ class KailleraGameImpl(
 
   override val players: MutableList<KailleraUser> = CopyOnWriteArrayList()
 
-  var lagLeewayNs = 0.seconds.inWholeNanoseconds
+  var lastLagReset = clock.now()
+    private set
+
+  private var lagLeewayNs = 0.seconds.inWholeNanoseconds
   var totalDriftNs = 0.seconds.inWholeNanoseconds
   val totalDriftCache = TimeOffsetCache(delay = flags.lagstatDuration, resolution = 5.seconds)
 
@@ -106,7 +115,6 @@ class KailleraGameImpl(
   private var lastAddressCount = 0
   private var isSynched = false
 
-  private val timeout = 100.milliseconds
   private val desynchTimeouts = 120
 
   private val statsCollector: StatsCollector? = server.statsCollector
@@ -156,7 +164,6 @@ class KailleraGameImpl(
     for (player in players) player.queueEvent(event)
   }
 
-  @Synchronized
   @Throws(GameChatException::class)
   override fun chat(user: KailleraUser, message: String?) {
     if (!players.contains(user)) {
@@ -182,13 +189,13 @@ class KailleraGameImpl(
     addEventForAllPlayers(GameChatEvent(this, user, message!!))
   }
 
-  @Synchronized
   fun announce(announcement: String, toUser: KailleraUser? = null) {
     addEventForAllPlayers(GameInfoEvent(this, announcement, toUser))
   }
 
+  @Synchronized
   @Throws(GameKickException::class)
-  override fun kick(requester: KailleraUser, userID: Int) = withLock {
+  override fun kick(requester: KailleraUser, userID: Int) {
     if (requester.accessLevel < AccessManager.ACCESS_ADMIN) {
       if (requester != owner) {
         logger.atWarning().log("%s kick denied: not the owner of %s", requester, this)
@@ -204,14 +211,14 @@ class KailleraGameImpl(
         try {
           if (requester.accessLevel != AccessManager.ACCESS_SUPERADMIN) {
             if (player.accessLevel >= AccessManager.ACCESS_ADMIN) {
-              return@withLock
+              return
             }
           }
           logger.atInfo().log("%s kicked: %s from %s", requester, userID, this)
           // SF MOD - Changed to IP rather than ID
           kickedUsers.add(player.connectSocketAddress.address.hostAddress)
           player.quitGame()
-          return@withLock
+          return
         } catch (e: Exception) {
           // this shouldn't happen
           logger
@@ -225,8 +232,9 @@ class KailleraGameImpl(
     throw GameKickException(EmuLang.getString("KailleraGameImpl.GameKickErrorUserNotFound"))
   }
 
+  @Synchronized
   @Throws(JoinGameException::class)
-  override fun join(user: KailleraUser): Int = withLock {
+  override fun join(user: KailleraUser): Int {
     val access = server.accessManager.getAccess(user.socketAddress!!.address)
 
     // SF MOD - Join room spam protection
@@ -380,8 +388,8 @@ class KailleraGameImpl(
       )
     }
 
-    val singleFrameDuration = 1.seconds / user.connectionType.updatesPerSecond
-    singleFrameDurationNs = singleFrameDuration.inWholeNanoseconds
+    singleFrameDurationForLagCalculationOnlyNs =
+      (1.seconds / user.connectionType.getUpdatesPerSecond(GAME_FPS)).inWholeNanoseconds
 
     // do not start if not game
     if (owner.game!!.romName.startsWith("*")) return
@@ -448,7 +456,8 @@ class KailleraGameImpl(
           gameBufferSize = bufferSize,
         )
       val delayVal =
-        60.0 / player.connectionType.byteValue * (player.ping.toMillisDouble() / 1000.0) + 1.0
+        GAME_FPS.toDouble() / player.connectionType.byteValue *
+          (player.ping.toMillisDouble() / 1000.0) + 1.0
       player.frameDelay = delayVal.toInt()
       if (delayVal.toInt() > highestUserFrameDelay) {
         highestUserFrameDelay = delayVal.toInt()
@@ -474,8 +483,9 @@ class KailleraGameImpl(
     addEventForAllPlayers(GameStartedEvent(this))
   }
 
+  @Synchronized
   @Throws(UserReadyException::class)
-  override fun ready(user: KailleraUser?, playerNumber: Int) = withLock {
+  override fun ready(user: KailleraUser?, playerNumber: Int) {
     if (!players.contains(user)) {
       logger.atWarning().log("%s ready game failed: not in %s", user, this)
       throw UserReadyException(EmuLang.getString("KailleraGameImpl.ReadyGameErrorNotInGame"))
@@ -514,8 +524,9 @@ class KailleraGameImpl(
     }
   }
 
+  @Synchronized
   @Throws(DropGameException::class)
-  override fun drop(user: KailleraUser, playerNumber: Int): Unit = withLock {
+  override fun drop(user: KailleraUser, playerNumber: Int) {
     if (!players.contains(user)) {
       logger.atWarning().log("%s drop game failed: not in %s", user, this)
       throw DropGameException(EmuLang.getString("KailleraGameImpl.DropGameErrorNotInGame"))
@@ -557,30 +568,30 @@ class KailleraGameImpl(
     }
   }
 
+  @Synchronized
   @Throws(DropGameException::class, QuitGameException::class, CloseGameException::class)
   override fun quit(user: KailleraUser, playerNumber: Int) {
-    synchronized(this) {
-      if (!players.remove(user)) {
-        logger.atWarning().log("%s quit game failed: not in %s", user, this)
-        throw QuitGameException(EmuLang.getString("KailleraGameImpl.QuitGameErrorNotInGame"))
-      }
-      logger.atInfo().log("%s quit: %s", user, this)
-      addEventForAllPlayers(UserQuitGameEvent(this, user))
-      user.ignoringUnnecessaryServerActivity = false
-      swap = false
-      if (status == GameStatus.WAITING) {
-        for (i in players.indices) {
-          getPlayer(i + 1)!!.playerNumber = i + 1
-          logger.atFine().log(getPlayer(i + 1)!!.name + ":::" + getPlayer(i + 1)!!.playerNumber)
-        }
+    if (!players.remove(user)) {
+      logger.atWarning().log("%s quit game failed: not in %s", user, this)
+      throw QuitGameException(EmuLang.getString("KailleraGameImpl.QuitGameErrorNotInGame"))
+    }
+    logger.atInfo().log("%s quit: %s", user, this)
+    addEventForAllPlayers(UserQuitGameEvent(this, user))
+    user.ignoringUnnecessaryServerActivity = false
+    swap = false
+    if (status == GameStatus.WAITING) {
+      for (i in players.indices) {
+        getPlayer(i + 1)!!.playerNumber = i + 1
+        logger.atFine().log(getPlayer(i + 1)!!.name + ":::" + getPlayer(i + 1)!!.playerNumber)
       }
     }
     if (user == owner) server.closeGame(this, user)
     else server.addEvent(GameStatusChangedEvent(server, this))
   }
 
+  @Synchronized
   @Throws(CloseGameException::class)
-  fun close(user: KailleraUser) = withLock {
+  fun close(user: KailleraUser) {
     if (user != owner) {
       logger.atWarning().log("%s close game denied: not the owner of %s", user, this)
       throw CloseGameException(EmuLang.getString("KailleraGameImpl.CloseGameErrorNotGameOwner"))
@@ -604,7 +615,8 @@ class KailleraGameImpl(
     players.clear()
   }
 
-  override fun droppedPacket(user: KailleraUser) = withLock {
+  @Synchronized
+  override fun droppedPacket(user: KailleraUser) {
     if (!isSynched) return
     val playerNumber = user.playerNumber
     if (user.playerNumber > playerActionQueues!!.size) {
@@ -743,27 +755,43 @@ class KailleraGameImpl(
   fun resetLag() {
     totalDriftCache.clear()
     totalDriftNs = 0
+    lastLagReset = clock.now()
   }
 
+  /** Sets the game framerate for lag measuring purposes. */
+  fun setGameFps(fps: Double) {
+    singleFrameDurationForLagCalculationOnlyNs =
+      (1.seconds / players.first().connectionType.getUpdatesPerSecond(fps)).inWholeNanoseconds
+    resetLag()
+    for (player in players) {
+      player.resetLag()
+    }
+  }
+
+  private val fps = metrics.meter("gameFps")
+
   private fun updateGameDrift() {
+    fps.mark()
+
     val nowNs = System.nanoTime()
     val delaySinceLastResponseNs = nowNs - lastFrameNs
 
-    lagLeewayNs += singleFrameDurationNs - delaySinceLastResponseNs
+    lagLeewayNs += singleFrameDurationForLagCalculationOnlyNs - delaySinceLastResponseNs
     if (lagLeewayNs < 0) {
       // Lag leeway fell below zero. Lag occurred!
       totalDriftNs += lagLeewayNs
       lagLeewayNs = 0
-    } else if (lagLeewayNs > singleFrameDurationNs) {
+    } else if (lagLeewayNs > singleFrameDurationForLagCalculationOnlyNs) {
       // Does not make sense to allow lag leeway to be longer than the length of one frame.
-      lagLeewayNs = singleFrameDurationNs
+      lagLeewayNs = singleFrameDurationForLagCalculationOnlyNs
     }
     totalDriftCache.update(totalDriftNs, nowNs = nowNs)
     lastFrameNs = nowNs
   }
 
   // it's very important this method is synchronized
-  private fun handleTimeout(e: PlayerTimeoutException) = withLock {
+  @Synchronized
+  private fun handleTimeout(e: PlayerTimeoutException) {
     if (!isSynched) return
     val playerNumber = e.playerNumber
     val timeoutNumber = e.timeoutNumber
@@ -797,12 +825,10 @@ class KailleraGameImpl(
     }
   }
 
-  private val lock = Object()
-
-  /** Helper function to avoid one level of indentation. */
-  private inline fun <T> withLock(action: () -> T): T = synchronized(lock) { action() }
-
   companion object {
     private val logger = FluentLogger.forEnclosingClass()
+
+    /** Unfortunately Kaillera is built on the assumption that all games run at 60FPS. */
+    const val GAME_FPS = 60
   }
 }

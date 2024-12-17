@@ -82,7 +82,8 @@ class EvalClient(
 
   private var playerNumber: Int? = null
 
-  private val delayBetweenPackets = 1.seconds.div(connectionType.updatesPerSecond).times(frameDelay)
+  private val delayBetweenPackets =
+    1.seconds.div(connectionType.getUpdatesPerSecond()).times(frameDelay)
 
   private var lastIncomingMessageNumber: Int = -1
 

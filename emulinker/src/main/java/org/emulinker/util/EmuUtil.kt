@@ -16,6 +16,9 @@ import java.util.concurrent.TimeUnit
 import kotlin.system.measureNanoTime
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.minutes
+import kotlin.time.DurationUnit.MINUTES
+import kotlin.time.DurationUnit.SECONDS
 import kotlinx.datetime.Instant
 import kotlinx.datetime.TimeZone
 import kotlinx.datetime.format.DateTimeComponents
@@ -306,6 +309,8 @@ object EmuUtil {
     Thread.yield()
   }
 
+  fun min(a: Duration, b: Duration) = if (a <= b) a else b
+
   inline fun <R> Timer.timeKt(toTime: () -> R): R {
     var out: R
     this.update(measureNanoTime { out = toTime() }, TimeUnit.NANOSECONDS)
@@ -314,4 +319,7 @@ object EmuUtil {
 
   fun Duration.toMillisDouble(): Double =
     this.inWholeNanoseconds / 1.milliseconds.inWholeNanoseconds.toDouble()
+
+  fun Duration.toSecondDoublePrecisionString() =
+    if (this < 1.minutes) toString(SECONDS, 2) else toString(MINUTES, 1)
 }

@@ -3,8 +3,11 @@ package org.emulinker.kaillera.controller.v086.action
 import com.google.common.flogger.FluentLogger
 import java.util.*
 import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.nanoseconds
-import kotlin.time.DurationUnit.MILLISECONDS
+import kotlin.time.DurationUnit.MINUTES
+import kotlin.time.DurationUnit.SECONDS
+import kotlinx.datetime.Clock
 import org.emulinker.config.RuntimeFlags
 import org.emulinker.kaillera.access.AccessManager
 import org.emulinker.kaillera.controller.messaging.MessageFormatException
@@ -15,12 +18,15 @@ import org.emulinker.kaillera.model.event.GameChatEvent
 import org.emulinker.kaillera.model.exception.ActionException
 import org.emulinker.kaillera.model.exception.GameChatException
 import org.emulinker.util.EmuLang
+import org.emulinker.util.EmuUtil.min
 import org.emulinker.util.EmuUtil.threadSleep
+import org.emulinker.util.EmuUtil.toSecondDoublePrecisionString
 
 class GameChatAction(
   private val gameOwnerCommandAction: GameOwnerCommandAction,
   private val lookingForGameReporter: TwitterBroadcaster,
   private val flags: RuntimeFlags,
+  private val clock: Clock,
 ) : V086Action<GameChatRequest>, V086GameEventHandler<GameChatEvent> {
   override var actionPerformedCount = 0
     private set
@@ -451,18 +457,22 @@ class GameChatAction(
           game.announce("No pending tweets.", clientHandler.user)
         }
       } else if (message.message == "/lagstat") {
-        game.chat(clientHandler.user, "/lagstat")
+        game.chat(clientHandler.user, message.message)
         // Note: This was duplicated from GameOwnerCommandAction.
         if (!game.startTimeout) {
           game.announce("Wait a minute or so after the game starts to run lagstat.")
           return
         }
+        val lagstatDuration = min(flags.lagstatDuration, clock.now() - game.lastLagReset)
+        val asString =
+          if (lagstatDuration < 1.minutes) lagstatDuration.toString(SECONDS)
+          else lagstatDuration.toString(MINUTES, 1)
         game.announce(
-          "Total lag over the last ${flags.lagstatDuration}: " +
+          "Total lag over the last ${asString}: " +
             (game.totalDriftNs - (game.totalDriftCache.getDelayedValue() ?: 0))
               .nanoseconds
               .absoluteValue
-              .toString(MILLISECONDS, decimals = 0)
+              .toSecondDoublePrecisionString()
         )
         game.announce(
           "Lag caused by players: " +
@@ -471,12 +481,20 @@ class GameChatAction(
               .joinToString(separator = ", ") { "P${it.playerNumber}: ${it.summarizeLag()}" }
         )
       } else if (message.message == "/lagreset") {
-        game.chat(clientHandler.user, "/lagreset")
+        game.chat(clientHandler.user, message.message)
         for (player in game.players) {
           player.resetLag()
         }
         game.resetLag()
         game.announce("LagStat has been reset!")
+      } else if (
+        message.message.startsWith("/fps") &&
+          message.message.removePrefix("/fps ").toDoubleOrNull() != null
+      ) {
+        game.chat(clientHandler.user, message.message)
+        val newFps = message.message.removePrefix("/fps ").toDouble()
+        game.setGameFps(newFps)
+        game.announce("Measuring lag for $newFps frames per second")
       } else {
         game.announce("Unknown Command: " + message.message, clientHandler.user)
       }
@@ -492,14 +510,15 @@ class GameChatAction(
         clientHandler.user.searchIgnoredUsers(
           gameChatEvent.user.connectSocketAddress.address.hostAddress
         )
-      )
+      ) {
         return
-      else if (clientHandler.user.ignoreAll) {
+      } else if (clientHandler.user.ignoreAll) {
         if (
           gameChatEvent.user.accessLevel < AccessManager.ACCESS_ADMIN &&
             gameChatEvent.user !== clientHandler.user
-        )
+        ) {
           return
+        }
       }
       val m = gameChatEvent.message
       clientHandler.send(
